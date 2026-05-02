@@ -1,0 +1,41 @@
+"Title" = "BusMasterIDE";
+"Family" = "Disk";
+"Version" = "0.19";
+"Location" = "";
+"Instance" = "0";
+"Driver Name" = "BusMasterIDE";
+"Class Names" = "IDEController IDEDisk ATAPIController";
+"Bus Type" = "PCI";
+"IRQ Levels" = "14 15";
+"I/O Ports" = "0x1f0-0x1f7 0x170-0x177";
+"Valid IRQ Levels" = "14 15";
+"Share IRQ Levels" = "Yes";
+"Boot Driver";
+"Debug" = "Yes";
+"Server Name" = "BusMasterIDE";
+"Disk Geometry" = "Yes";
+"Address Mode" = "LBA";
+"Multiple Sectors" = "Yes";
+"EIDE Support" = "Yes";
+"Use Disk Geometry" = "Yes";
+"IOCHRDY Support" = "Yes";
+"Master" = "Auto";
+"Slave" = "Auto";
+"Master Secondary" = "Auto";
+"Slave Secondary" = "Auto";
+"Master Modes Mask" = "0x000000ff";
+"Slave Modes Mask" = "0x000000ff";
+"Master Modes Mask Secondary" = "0x000000ff";
+"Slave Modes Mask Secondary" = "0x000000ff";
+
+/*
+ * Runtime matching is generic: PCI class 01/01, prog-if bit 7 set,
+ * command BusMaster enabled, and a valid I/O BAR4. 
+ * OPENSTEP's PCI autoconfiguration still needs seed vendor/device IDs to instantiate.
+ */
+"Auto Detect IDs" = "0x70108086 0x71118086 0x24db8086 0x29208086 0x1c008086 0x1c018086 0x1c088086 0x1c098086";
+
+"IOBlockMajor" = "3";
+"IOCharacterMajor" = "15";
+"Block Major" = "3";
+"Character Major" = "15";

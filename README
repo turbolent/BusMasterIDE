@@ -1,0 +1,5 @@
+IDE ATA/ATAPI driver for OPENSTEP that targets PCI IDE controllers with 
+a standard BAR4 bus-master DMA register block.
+
+It is intended for systems where the BIOS exposes SATA disks through 
+legacy IDE emulation and enables PCI bus mastering.
