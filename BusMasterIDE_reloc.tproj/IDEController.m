@@ -6,9 +6,11 @@
 #import <driverkit/kernelDriver.h>
 #import <driverkit/generalFuncs.h>
 #import <driverkit/return.h>
+#import <kernserv/clock_timer.h>
 #import <kernserv/prototypes.h>
 #import <machkit/NXLock.h>
 #import <sys/systm.h>
+#import "BMIDEDMA.h"
 
 #define PCI_COMMAND_REG         0x04
 #define PCI_CLASS_REG           0x08
@@ -16,6 +18,12 @@
 
 #define PCI_COMMAND_IO          0x0001
 #define PCI_COMMAND_BM          0x0004
+#define PCI_STATUS_MASTER_PARITY    0x0100
+#define PCI_STATUS_SIG_TARGET_ABORT 0x0800
+#define PCI_STATUS_REC_TARGET_ABORT 0x1000
+#define PCI_STATUS_REC_MASTER_ABORT 0x2000
+#define PCI_STATUS_SIG_SYSTEM_ERROR 0x4000
+#define PCI_STATUS_DET_PARITY_ERROR 0x8000
 
 #define PCI_PROGIF_BM_CAPABLE   0x80
 #define PCI_PROGIF_NATIVE       0x05
@@ -25,6 +33,15 @@
 #define ATA_SR_DF               0x20
 #define ATA_SR_DRDY             0x40
 #define ATA_SR_BSY              0x80
+
+#define ATA_ER_AMNF             0x01
+#define ATA_ER_TK0NF            0x02
+#define ATA_ER_ABRT             0x04
+#define ATA_ER_MCR              0x08
+#define ATA_ER_IDNF             0x10
+#define ATA_ER_MC               0x20
+#define ATA_ER_UNC              0x40
+#define ATA_ER_ICRC             0x80
 
 #define ATA_DEV_LBA             0x40
 #define ATA_DEV_MASTER          0x00
@@ -73,7 +90,7 @@
 #define WAIT_DMA_US             5000000
 #define DIAG_DMA_LOG_LIMIT      0
 #define DMA_MAX_ATTEMPTS        2
-#define BMIDE_DRIVER_VERSION   "0.20"
+#define BMIDE_DRIVER_VERSION   "0.21"
 
 static void
 bmideDelay400ns(BMIDERegs *regs)
@@ -112,10 +129,41 @@ bmideWaitNotBusy(BMIDERegs *regs, unsigned char *lastStatus)
                           lastStatus);
 }
 
-static int
-bmideAtaStatusGood(unsigned char status)
+static void
+bmideLogDecodedStatus(const char *phase,
+                       unsigned char bmStatus,
+                       unsigned char ataStatus,
+                       unsigned char ataError,
+                       unsigned short pciStatus, BOOL pciStatusValid)
 {
-    return ((status & (ATA_SR_BSY | ATA_SR_ERR | ATA_SR_DF)) == 0);
+    IOLog("IDE: %s bits BM active %u err %u intr %u ATA bsy %u drdy %u df %u err %u ATAERR amnf %u tk0nf %u abrt %u mcr %u idnf %u mc %u unc %u icrc %u\n",
+          phase,
+          (bmStatus & BM_STATUS_ACTIVE) != 0,
+          (bmStatus & BM_STATUS_ERROR) != 0,
+          (bmStatus & BM_STATUS_INTERRUPT) != 0,
+          (ataStatus & ATA_SR_BSY) != 0,
+          (ataStatus & ATA_SR_DRDY) != 0,
+          (ataStatus & ATA_SR_DF) != 0,
+          (ataStatus & ATA_SR_ERR) != 0,
+          (ataError & ATA_ER_AMNF) != 0,
+          (ataError & ATA_ER_TK0NF) != 0,
+          (ataError & ATA_ER_ABRT) != 0,
+          (ataError & ATA_ER_MCR) != 0,
+          (ataError & ATA_ER_IDNF) != 0,
+          (ataError & ATA_ER_MC) != 0,
+          (ataError & ATA_ER_UNC) != 0,
+          (ataError & ATA_ER_ICRC) != 0);
+    if (!pciStatusValid) {
+        IOLog("IDE: PCI status unavailable\n");
+        return;
+    }
+    IOLog("IDE: PCI mdp %u sta %u rta %u rma %u sse %u dpe %u\n",
+          (pciStatus & PCI_STATUS_MASTER_PARITY) != 0,
+          (pciStatus & PCI_STATUS_SIG_TARGET_ABORT) != 0,
+          (pciStatus & PCI_STATUS_REC_TARGET_ABORT) != 0,
+          (pciStatus & PCI_STATUS_REC_MASTER_ABORT) != 0,
+          (pciStatus & PCI_STATUS_SIG_SYSTEM_ERROR) != 0,
+          (pciStatus & PCI_STATUS_DET_PARITY_ERROR) != 0);
 }
 
 static int
@@ -283,14 +331,6 @@ bmideSamePrdWindow(unsigned int base, unsigned int phys)
 }
 
 static void
-bmideStopBmDma(unsigned short bmBase)
-{
-    outb(bmBase + BM_REG_COMMAND,
-         inb(bmBase + BM_REG_COMMAND) & ~BM_CMD_START);
-    outb(bmBase + BM_REG_STATUS, BM_STATUS_CLEAR);
-}
-
-static void
 bmideProgramPrd(unsigned short bmBase, unsigned int prdPhys)
 {
     outw(bmBase + BM_REG_PRD, (unsigned short)(prdPhys & 0xffff));
@@ -308,26 +348,6 @@ bmideProgramLba28(BMIDERegs *regs, unsigned int drive,
     outb(regs->device, 0xe0 | (drive ? ATA_DEV_SLAVE : 0) |
          ((lba >> 24) & 0x0f));
     bmideDelay400ns(regs);
-}
-
-static void
-bmidePollDma(unsigned short bmBase, BMIDERegs *regs,
-              unsigned int *waited, unsigned char *bmStatus,
-              unsigned char *status)
-{
-    for (*waited = 0; *waited < WAIT_DMA_US; *waited += 10) {
-        *bmStatus = inb(bmBase + BM_REG_STATUS);
-        *status = inb(regs->altStatus);
-        if (*bmStatus & (BM_STATUS_INTERRUPT | BM_STATUS_ERROR))
-            break;
-        if ((*status & ATA_SR_BSY) == 0 &&
-            (*status & (ATA_SR_ERR | ATA_SR_DF)) != 0)
-            break;
-        if ((*bmStatus & BM_STATUS_ACTIVE) == 0 &&
-            bmideAtaStatusGood(*status))
-            break;
-        IODelay(10);
-    }
 }
 
 @implementation IDEController
@@ -803,6 +823,11 @@ bmidePollDma(unsigned short bmBase, BMIDERegs *regs,
     unsigned char ataError;
     unsigned int attempt;
     IOReturn rtn;
+    unsigned long pciCommandStatus;
+    unsigned short pciStatus;
+    BOOL pciStatusValid;
+    BMIDEDMACompletion completion;
+    BMIDEDMAResult dmaResult;
 
     if (actual != 0)
         *actual = 0;
@@ -826,6 +851,7 @@ bmidePollDma(unsigned short bmBase, BMIDERegs *regs,
     bmStatus = 0;
     ataError = 0;
     attempt = 1;
+    pciStatus = 0;
     [_cmdLock lock];
     if ([self buildPrdForBuffer:buffer length:length client:client] == NO) {
         IOLog("IDE: PRD setup failed, no PIO fallback\n");
@@ -876,46 +902,33 @@ retryDma:
     bmideProgramLba28(regs, drive->drive, lba, ataSectorCount);
 
     outb(regs->command, isWrite ? ATA_CMD_WRITE_DMA : ATA_CMD_READ_DMA);
+    /* Flush the task-file command and allow its status transition before
+     * handing the transfer to the bus master (ATA HDMA0 -> HDMA1).
+     */
+    (void)inb(regs->altStatus);
+    IODelay(1); /* DriverKit's microsecond API rounds the 400 ns minimum up. */
     outb(bmBase + BM_REG_COMMAND, bmCommand | BM_CMD_START);
 
-    bmidePollDma(bmBase, regs, &waited, &bmStatus, &status);
+    dmaResult = bmidePollDma(bmBase, regs, WAIT_DMA_US, &completion);
+    bmStatus = completion.bmStatus;
+    status = completion.ataStatus;
+    waited = completion.waited;
+    ataError = (dmaResult == BMIDE_DMA_COMPLETE) ? 0 : inb(regs->error);
+    bmideFinishBmDma(bmBase, bmCommand, bmStatus);
 
-    outb(bmBase + BM_REG_COMMAND, bmCommand & ~BM_CMD_START);
-    bmStatus = inb(bmBase + BM_REG_STATUS);
-    outb(bmBase + BM_REG_STATUS, BM_STATUS_CLEAR);
-    status = inb(regs->status);
-
-    if (waited >= WAIT_DMA_US &&
-        !((bmStatus & BM_STATUS_ACTIVE) == 0 && bmideAtaStatusGood(status))) {
-        ataError = inb(regs->error);
-        IOLog("IDE: DMA timeout drive %d LBA %u waited %u BM %02x ATA %02x ERR %02x\n",
-              index, lba, waited, bmStatus, status, ataError);
-        _dmaTimeouts++;
-        rtn = IO_R_TIMEOUT;
-        goto failedDma;
-    }
-    if (bmStatus & BM_STATUS_ERROR) {
-        ataError = inb(regs->error);
-        IOLog("IDE: BM-DMA error drive %d LBA %u waited %u BM %02x ATA %02x ERR %02x\n",
-              index, lba, waited, bmStatus, status, ataError);
-        _dmaBmErrors++;
-        rtn = IO_R_IO;
-        goto failedDma;
-    }
-    if (bmStatus & BM_STATUS_ACTIVE) {
-        ataError = inb(regs->error);
-        IOLog("IDE: BM-DMA incomplete drive %d LBA %u waited %u BM %02x ATA %02x ERR %02x\n",
-              index, lba, waited, bmStatus, status, ataError);
-        _dmaBmErrors++;
-        rtn = IO_R_IO;
-        goto failedDma;
-    }
-    if (status & (ATA_SR_ERR | ATA_SR_DF | ATA_SR_BSY)) {
-        ataError = inb(regs->error);
-        IOLog("IDE: ATA status error drive %d LBA %u waited %u BM %02x ATA %02x ERR %02x\n",
-              index, lba, waited, bmStatus, status, ataError);
-        _dmaAtaErrors++;
-        rtn = IO_R_IO;
+    if (dmaResult != BMIDE_DMA_COMPLETE) {
+        if (dmaResult == BMIDE_DMA_TIMEOUT) {
+            _dmaTimeouts++;
+            rtn = IO_R_TIMEOUT;
+        } else {
+            if (dmaResult == BMIDE_DMA_DEVICE_ERROR)
+                _dmaAtaErrors++;
+            else
+                _dmaBmErrors++;
+            rtn = IO_R_IO;
+        }
+        IOLog("IDE: DMA failed drive %d LBA %u result %d waited %u BM %02x ATA %02x ERR %02x\n",
+              index, lba, dmaResult, waited, bmStatus, status, ataError);
         goto failedDma;
     }
 
@@ -926,21 +939,27 @@ retryDma:
 
 failedDma:
     bmideStopBmDma(bmBase);
+    pciStatusValid = ([self getPCIConfigData:&pciCommandStatus
+                                 atRegister:PCI_COMMAND_REG] == IO_R_SUCCESS);
+    pciStatus = pciStatusValid ? (pciCommandStatus >> 16) & 0xffff : 0;
+    bmideLogDecodedStatus("DMA failure", bmStatus, status, ataError,
+                          pciStatus, pciStatusValid);
     _dmaResets++;
     [self softResetChannel:drive->channel];
     (void)bmideWaitNotBusy(regs, 0);
     if (attempt < DMA_MAX_ATTEMPTS) {
         attempt++;
         _dmaRetries++;
-        IOLog("IDE: retry DMA %s drive %d LBA %u sectors %u attempt %u rtn %d BM %02x ATA %02x ERR %02x counts retry %u timeout %u bmerr %u ataerr %u reset %u\n",
+        IOLog("IDE: retry DMA %s drive %d LBA %u sectors %u attempt %u rtn %d BM %02x ATA %02x ERR %02x pciStat %04x valid %u counts retry %u timeout %u bmerr %u ataerr %u reset %u\n",
               bmideDirectionString(isWrite), index, lba, sectors, attempt,
-              rtn, bmStatus, status, ataError, _dmaRetries, _dmaTimeouts,
-              _dmaBmErrors, _dmaAtaErrors, _dmaResets);
+              rtn, bmStatus, status, ataError, pciStatus, pciStatusValid, _dmaRetries,
+              _dmaTimeouts, _dmaBmErrors, _dmaAtaErrors, _dmaResets);
         goto retryDma;
     }
-    IOLog("IDE: final DMA failure %s drive %d ch %u dev %u LBA %u sectors %u rtn %d BM %02x ATA %02x ERR %02x counts retry %u timeout %u bmerr %u ataerr %u reset %u\n",
+    IOLog("IDE: final DMA failure %s drive %d ch %u dev %u LBA %u sectors %u rtn %d BM %02x ATA %02x ERR %02x pciStat %04x valid %u counts retry %u timeout %u bmerr %u ataerr %u reset %u\n",
           bmideDirectionString(isWrite), index, drive->channel, drive->drive,
-          lba, sectors, rtn, bmStatus, status, ataError, _dmaRetries,
+          lba, sectors, rtn, bmStatus, status, ataError, pciStatus, pciStatusValid,
+          _dmaRetries,
           _dmaTimeouts, _dmaBmErrors, _dmaAtaErrors, _dmaResets);
     goto done;
 

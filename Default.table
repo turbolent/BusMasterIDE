@@ -1,6 +1,6 @@
 "Title" = "BusMasterIDE";
 "Family" = "Disk";
-"Version" = "0.20";
+"Version" = "0.21";
 "Location" = "";
 "Instance" = "0";
 "Driver Name" = "BusMasterIDE";

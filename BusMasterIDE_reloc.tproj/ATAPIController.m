@@ -59,7 +59,7 @@ static id probedControllers[ATAPI_MAX_PROBED_CONTROLLERS];
 static BOOL
 atapiCommandNeedsMapping(unsigned char command)
 {
-    int i;
+    unsigned int i;
 
     for (i = 0; i < ATAPI_MAPPED_CMD_COUNT; i++) {
         if (command == mapToAtapi[i])
@@ -318,12 +318,13 @@ static Protocol *protocols[] = {
     sc_status_t ret;
     sc_status_t driverStatus;
     BOOL cmdMapped;
+    BOOL locked;
+    BOOL logSuccess;
+    BOOL needsReadCapacityFix;
     unsigned short cmdLen;
 
     if (scsiReq == 0)
         return SR_IOST_CMDREJ;
-
-    [_ataController atapiControllerLock];
 
     my_cdb = scsiReq->cdb;
     bzero(&atapiIoReq, sizeof(atapiIoReq_t));
@@ -337,10 +338,33 @@ static Protocol *protocols[] = {
 
     scsiCmd = (unsigned char *)&(my_cdb.cdb_opcode);
     atapiIoReq.scsiCmd = *scsiCmd;
+    ret = SR_IOST_GOOD;
+    driverStatus = SR_IOST_GOOD;
+    locked = NO;
+    logSuccess = NO;
+    needsReadCapacityFix = NO;
 
     cmdLen = [self scsiCmdLen:scsiReq];
+    if (cmdLen == 0) {
+        scsiReq->bytesTransferred = 0;
+        scsiReq->scsiStatus = STAT_CHECK;
+        scsiReq->driverStatus = SR_IOST_CMDREJ;
+        return SR_IOST_CMDREJ;
+    }
     for (i = 0; i < cmdLen; i++)
         atapiIoReq.atapiCmd[i] = scsiCmd[i];
+
+    if (!atapiCommandNeedsMapping(atapiIoReq.atapiCmd[0]) &&
+        [self emulateSCSICmd:&atapiIoReq buffer:buffer client:client] == YES) {
+        scsiReq->bytesTransferred = atapiIoReq.bytesTransferred;
+        scsiReq->scsiStatus = atapiIoReq.scsiStatus;
+        scsiReq->driverStatus = SR_IOST_GOOD;
+        atapiLogInterestingSuccess(&atapiIoReq, buffer, client);
+        return SR_IOST_GOOD;
+    }
+
+    [_ataController atapiControllerLock];
+    locked = YES;
 
     cmdMapped = NO;
     if (atapiCommandNeedsMapping(atapiIoReq.atapiCmd[0])) {
@@ -351,9 +375,9 @@ static Protocol *protocols[] = {
             scsiReq->driverStatus = SR_IOST_CMDREJ;
             scsiReq->scsiStatus = STAT_CHECK;
             atapiIoReq.scsiStatus = STAT_CHECK;
-            atapiLogFailedRequest(&atapiIoReq, SR_IOST_CMDREJ);
-            [_ataController atapiControllerUnlock];
-            return SR_IOST_CMDREJ;
+            driverStatus = SR_IOST_CMDREJ;
+            ret = driverStatus;
+            goto unlockDone;
         }
         cmdMapped = YES;
     }
@@ -362,9 +386,10 @@ static Protocol *protocols[] = {
         scsiReq->bytesTransferred = atapiIoReq.bytesTransferred;
         scsiReq->scsiStatus = atapiIoReq.scsiStatus;
         scsiReq->driverStatus = SR_IOST_GOOD;
-        atapiLogInterestingSuccess(&atapiIoReq, buffer, client);
-        [_ataController atapiControllerUnlock];
-        return SR_IOST_GOOD;
+        logSuccess = YES;
+        ret = SR_IOST_GOOD;
+        driverStatus = ret;
+        goto unlockDone;
     }
 
     if (cmdMapped)
@@ -386,9 +411,8 @@ static Protocol *protocols[] = {
                 scsiReq->driverStatus = driverStatus;
                 scsiReq->scsiStatus = STAT_CHECK;
                 atapiIoReq.scsiStatus = STAT_CHECK;
-                atapiLogFailedRequest(&atapiIoReq, driverStatus);
-                [_ataController atapiControllerUnlock];
-                return driverStatus;
+                ret = driverStatus;
+                goto unlockDone;
             }
         }
     }
@@ -396,7 +420,17 @@ static Protocol *protocols[] = {
     if ((driverStatus == SR_IOST_GOOD) &&
         (atapiIoReq.scsiStatus == STAT_GOOD) &&
         (atapiIoReq.atapiCmd[0] == C10OP_READCAPACITY) &&
-        (atapiIoReq.lun == 0) && buffer != 0) {
+        (atapiIoReq.lun == 0) && buffer != 0)
+        needsReadCapacityFix = YES;
+
+    if (ret == SR_IOST_GOOD && atapiIoReq.scsiStatus == STAT_GOOD)
+        logSuccess = YES;
+
+unlockDone:
+    if (locked)
+        [_ataController atapiControllerUnlock];
+
+    if (needsReadCapacityFix) {
         unsigned int blockSize;
         unsigned int value;
         unsigned char *buf;
@@ -404,36 +438,32 @@ static Protocol *protocols[] = {
 
         if (atapiMapClientBuffer(client, buffer, 8, &mapped) == NO) {
             driverStatus = SR_IOST_HW;
-            scsiReq->driverStatus = driverStatus;
-            scsiReq->scsiStatus = STAT_CHECK;
+            ret = driverStatus;
             atapiIoReq.scsiStatus = STAT_CHECK;
-            atapiLogFailedRequest(&atapiIoReq, driverStatus);
-            [_ataController atapiControllerUnlock];
-            return driverStatus;
+        } else {
+            buf = (unsigned char *)mapped.addr;
+            blockSize = atapiReadU32BE(buf + 4);
+            if (blockSize == 0)
+                blockSize = ATAPI_CD_BLOCK_SIZE;
+            for (value = 16; value < blockSize; value *= 2)
+                ;
+            if (value > blockSize) {
+                blockSize = value / 2;
+                atapiWriteU32BE(buf + 4, blockSize);
+            }
+            atapiUnmapClientBuffer(&mapped);
         }
-
-        buf = (unsigned char *)mapped.addr;
-        blockSize = atapiReadU32BE(buf + 4);
-        if (blockSize == 0)
-            blockSize = ATAPI_CD_BLOCK_SIZE;
-        for (value = 16; value < blockSize; value *= 2)
-            ;
-        if (value > blockSize) {
-            blockSize = value / 2;
-            atapiWriteU32BE(buf + 4, blockSize);
-        }
-        atapiUnmapClientBuffer(&mapped);
     }
 
     scsiReq->bytesTransferred = atapiIoReq.bytesTransferred;
     scsiReq->scsiStatus = atapiIoReq.scsiStatus;
     scsiReq->driverStatus = driverStatus;
-    if (ret == SR_IOST_GOOD && atapiIoReq.scsiStatus == STAT_GOOD)
+    if (logSuccess && driverStatus == SR_IOST_GOOD &&
+        atapiIoReq.scsiStatus == STAT_GOOD)
         atapiLogInterestingSuccess(&atapiIoReq, buffer, client);
     atapiLogFailedRequest(&atapiIoReq, ret);
 
-    [_ataController atapiControllerUnlock];
-    return ret;
+    return driverStatus;
 }
 
 - (BOOL)maptoAtapiCmd:(atapiIoReq_t *)atapiIoReq

@@ -5,8 +5,10 @@
 #import <driverkit/i386/ioPorts.h>
 #import <driverkit/kernelDriver.h>
 #import <kernserv/prototypes.h>
+#import <kernserv/clock_timer.h>
 #import <machkit/NXLock.h>
 #import <sys/systm.h>
+#import "BMIDEDMA.h"
 
 #define ATA_SR_ERR              0x01
 #define ATA_SR_DRQ              0x08
@@ -58,7 +60,6 @@
 #define BM_STATUS_INTERRUPT     0x04
 #define BM_STATUS_CLEAR         (BM_STATUS_ERROR | BM_STATUS_INTERRUPT)
 #define WAIT_ATAPI_DMA_US       30000000
-#define ATAPI_MAX_BUSY_POLLS    100000
 
 static void
 bmideAtapiDelay400ns(BMIDERegs *regs)
@@ -239,24 +240,10 @@ bmideAtapiXferData(caddr_t addr, BOOL read, vm_task_t client,
 }
 
 static void
-bmideAtapiStopBmDma(unsigned short bmBase)
-{
-    outb(bmBase + BM_REG_COMMAND,
-         inb(bmBase + BM_REG_COMMAND) & ~BM_CMD_START);
-    outb(bmBase + BM_REG_STATUS, BM_STATUS_CLEAR);
-}
-
-static void
 bmideAtapiProgramPrd(unsigned short bmBase, unsigned int prdPhys)
 {
     outw(bmBase + BM_REG_PRD, (unsigned short)(prdPhys & ATAPI_WORD_MASK));
     outw(bmBase + BM_REG_PRD + 2, (unsigned short)(prdPhys >> 16));
-}
-
-static BOOL
-bmideAtapiAtaStatusGood(unsigned char status)
-{
-    return ((status & (ATA_SR_BSY | ATA_SR_ERR)) == 0);
 }
 
 static unsigned char
@@ -730,12 +717,13 @@ bmideAtapiDeviceTypeString(unsigned char deviceType)
     unsigned char bmStatus;
     unsigned char status;
     unsigned char ataError;
-    unsigned int busyPoll;
     void *dmaBuffer;
     void *bounceAlloc;
     vm_task_t dmaClient;
     unsigned int length;
     sc_status_t rtn;
+    BMIDEDMACompletion completion;
+    BMIDEDMAResult dmaResult;
 
     regs = [self atapiRegsForUnit:atapiIoReq->drive];
     if (regs == 0)
@@ -776,54 +764,30 @@ bmideAtapiDeviceTypeString(unsigned char deviceType)
         goto done;
     }
 
-    bmideAtapiStopBmDma(bmBase);
+    bmideStopBmDma(bmBase);
     bmideAtapiProgramPrd(bmBase, _prdPhys);
     outb(bmBase + BM_REG_COMMAND, BM_CMD_READ);
 
     outb(bmBase + BM_REG_COMMAND, BM_CMD_READ | BM_CMD_START);
 
-    for (waited = 0; waited < WAIT_ATAPI_DMA_US; waited += 10) {
-        bmStatus = inb(bmBase + BM_REG_STATUS);
-        status = inb(regs->altStatus);
-        if (bmStatus & (BM_STATUS_INTERRUPT | BM_STATUS_ERROR))
-            break;
-        if ((bmStatus & BM_STATUS_ACTIVE) == 0 &&
-            bmideAtapiAtaStatusGood(status))
-            break;
-        IODelay(10);
-    }
+    dmaResult = bmidePollDma(bmBase, regs, WAIT_ATAPI_DMA_US, &completion);
+    bmStatus = completion.bmStatus;
+    status = completion.ataStatus;
+    waited = completion.waited;
+    ataError = (dmaResult == BMIDE_DMA_COMPLETE) ? 0 : inb(regs->error);
+    bmideFinishBmDma(bmBase, BM_CMD_READ, bmStatus);
 
-    outb(bmBase + BM_REG_COMMAND,
-         inb(bmBase + BM_REG_COMMAND) & ~BM_CMD_START);
-    bmStatus = inb(bmBase + BM_REG_STATUS);
-    outb(bmBase + BM_REG_STATUS, BM_STATUS_CLEAR);
-    status = inb(regs->status);
-
-    for (busyPoll = 0; busyPoll < ATAPI_MAX_BUSY_POLLS; busyPoll++) {
-        if ((status & ATA_SR_BSY) == 0)
-            break;
-        IODelay(10);
-        status = inb(regs->status);
-    }
-
-    if (waited >= WAIT_ATAPI_DMA_US &&
-        !((bmStatus & BM_STATUS_ACTIVE) == 0 &&
-          bmideAtapiAtaStatusGood(status))) {
-        ataError = inb(regs->error);
-        IOLog("ATAPI: DMA timeout unit %d waited %u BM %02x ATA %02x ERR %02x len %u\n",
-              atapiIoReq->drive, waited, bmStatus, status, ataError, length);
-        [self atapiSoftReset:atapiIoReq->drive];
-        rtn = SR_IOST_CHKSNV;
-        goto done;
-    }
-
-    if ((bmStatus & BM_STATUS_ERROR) || (bmStatus & BM_STATUS_ACTIVE) ||
-        !bmideAtapiAtaStatusGood(status)) {
-        ataError = inb(regs->error);
-        IOLog("ATAPI: DMA error unit %d waited %u BM %02x ATA %02x ERR %02x len %u\n",
-              atapiIoReq->drive, waited, bmStatus, status, ataError, length);
-        [self atapiSoftReset:atapiIoReq->drive];
-        rtn = SR_IOST_CHKSNV;
+    if (dmaResult != BMIDE_DMA_COMPLETE) {
+        IOLog("ATAPI: DMA failed unit %d result %d waited %u BM %02x ATA %02x ERR %02x len %u\n",
+              atapiIoReq->drive, dmaResult, waited, bmStatus, status,
+              ataError, length);
+        if (dmaResult == BMIDE_DMA_DEVICE_ERROR) {
+            /* Preserve device sense data for the next REQUEST SENSE. */
+            rtn = SR_IOST_CHKSNV;
+        } else {
+            [self atapiSoftReset:atapiIoReq->drive];
+            rtn = SR_IOST_HW;
+        }
         goto done;
     }
 
@@ -846,7 +810,7 @@ bmideAtapiDeviceTypeString(unsigned char deviceType)
     rtn = SR_IOST_GOOD;
 
 done:
-    bmideAtapiStopBmDma(bmBase);
+    bmideStopBmDma(bmBase);
     if (bounceAlloc != 0)
         IOFree(bounceAlloc, length + ATAPI_DMA_ALIGN);
     return rtn;

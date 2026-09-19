@@ -7,7 +7,7 @@ LANGUAGE = English
 CLASSES = IDEController.m IDEDisk.m IDEKernel.m \
           ATAPIController.m ATAPIControllerCmds.m
 
-HFILES = IDE.h IDEController.h IDEDisk.h \
+HFILES = BMIDEDMA.h IDE.h IDEController.h IDEDisk.h \
          IDEKernel.h ATAPIController.h ATAPIControllerCmds.h \
          ATAPIControllerPublic.h atapi_extern.h
 
