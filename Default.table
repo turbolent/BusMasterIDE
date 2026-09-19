@@ -1,6 +1,6 @@
 "Title" = "BusMasterIDE";
 "Family" = "Disk";
-"Version" = "0.19";
+"Version" = "0.20";
 "Location" = "";
 "Instance" = "0";
 "Driver Name" = "BusMasterIDE";
@@ -30,7 +30,8 @@
 
 /*
  * Runtime matching is generic: PCI class 01/01, prog-if bit 7 set,
- * command BusMaster enabled, and a valid I/O BAR4. 
+ * both channels in legacy mode, and an assigned I/O BAR4 in the 16-bit range.
+ * The driver enables and verifies PCI I/O decoding and BusMaster if needed.
  * OPENSTEP's PCI autoconfiguration still needs seed vendor/device IDs to instantiate.
  */
 "Auto Detect IDs" = "0x70108086 0x71118086 0x24db8086 0x29208086 0x1c008086 0x1c018086 0x1c088086 0x1c098086";

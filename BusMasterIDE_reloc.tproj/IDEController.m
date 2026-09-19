@@ -18,6 +18,7 @@
 #define PCI_COMMAND_BM          0x0004
 
 #define PCI_PROGIF_BM_CAPABLE   0x80
+#define PCI_PROGIF_NATIVE       0x05
 
 #define ATA_SR_ERR              0x01
 #define ATA_SR_DRQ              0x08
@@ -72,7 +73,7 @@
 #define WAIT_DMA_US             5000000
 #define DIAG_DMA_LOG_LIMIT      0
 #define DMA_MAX_ATTEMPTS        2
-#define BMIDE_DRIVER_VERSION   "0.19"
+#define BMIDE_DRIVER_VERSION   "0.20"
 
 static void
 bmideDelay400ns(BMIDERegs *regs)
@@ -395,19 +396,33 @@ bmidePollDma(unsigned short bmBase, BMIDERegs *regs,
     unsigned long commandData;
     unsigned long classData;
     unsigned long bar4Data;
+    unsigned long commandWrite;
+    unsigned long commandVerify;
+    unsigned long bmiba;
     unsigned int classCode;
     unsigned int subClass;
     unsigned int progIf;
 
     if ([self getPCIConfigData:&commandData atRegister:PCI_COMMAND_REG]
-        != IO_R_SUCCESS)
+        != IO_R_SUCCESS) {
+        IOLog("IDE: cannot read PCI command register\n");
         return NO;
+    }
     if ([self getPCIConfigData:&classData atRegister:PCI_CLASS_REG]
-        != IO_R_SUCCESS)
+        != IO_R_SUCCESS) {
+        IOLog("IDE: cannot read PCI class register\n");
         return NO;
+    }
     if ([self getPCIConfigData:&bar4Data atRegister:PCI_BAR4_REG]
-        != IO_R_SUCCESS)
+        != IO_R_SUCCESS) {
+        IOLog("IDE: cannot read PCI BAR4\n");
         return NO;
+    }
+    if ((commandData & 0xffffUL) == 0xffffUL ||
+        classData == 0xffffffffUL || bar4Data == 0xffffffffUL) {
+        IOLog("IDE: PCI configuration is unavailable (all ones)\n");
+        return NO;
+    }
 
     classCode = (classData >> 24) & 0xff;
     subClass = (classData >> 16) & 0xff;
@@ -423,9 +438,8 @@ bmidePollDma(unsigned short bmBase, BMIDERegs *regs,
         IOLog("IDE: controller has no BM-DMA prog-if bit\n");
         return NO;
     }
-    if ((commandData & (PCI_COMMAND_IO | PCI_COMMAND_BM))
-        != (PCI_COMMAND_IO | PCI_COMMAND_BM)) {
-        IOLog("IDE: PCI I/O or BusMaster command bit is disabled\n");
+    if (progIf & PCI_PROGIF_NATIVE) {
+        IOLog("IDE: native-mode IDE channels are unsupported\n");
         return NO;
     }
     if ((bar4Data & 0x01) == 0) {
@@ -433,9 +447,45 @@ bmidePollDma(unsigned short bmBase, BMIDERegs *regs,
         return NO;
     }
 
-    _bmiba = (unsigned short)(bar4Data & 0xfff0);
-    if (_bmiba == 0)
+    /* Validate the full I/O address before narrowing it to a port number. */
+    bmiba = bar4Data & 0xfffffffcUL;
+    if (bmiba == 0 || bmiba > 0xfff0UL || (bmiba & 0x0fUL) != 0) {
+        IOLog("IDE: BAR4 has an unassigned or unsupported I/O address %08x\n",
+              (unsigned int)bar4Data);
         return NO;
+    }
+
+    if ((commandData & (PCI_COMMAND_IO | PCI_COMMAND_BM))
+        != (PCI_COMMAND_IO | PCI_COMMAND_BM)) {
+        /* DriverKit writes a dword: write zero to the W1C Status half. */
+        commandWrite = (commandData & 0xffffUL)
+            | PCI_COMMAND_IO | PCI_COMMAND_BM;
+        if ([self setPCIConfigData:commandWrite atRegister:PCI_COMMAND_REG]
+            != IO_R_SUCCESS) {
+            IOLog("IDE: cannot enable PCI I/O and BusMaster (command %04x -> %04x)\n",
+                  (unsigned int)(commandData & 0xffffUL),
+                  (unsigned int)commandWrite);
+            return NO;
+        }
+        if ([self getPCIConfigData:&commandVerify atRegister:PCI_COMMAND_REG]
+            != IO_R_SUCCESS) {
+            IOLog("IDE: cannot verify PCI I/O and BusMaster enable\n");
+            return NO;
+        }
+        if ((commandVerify & 0xffffUL) == 0xffffUL ||
+            (commandVerify & (PCI_COMMAND_IO | PCI_COMMAND_BM))
+            != (PCI_COMMAND_IO | PCI_COMMAND_BM)) {
+            IOLog("IDE: PCI I/O and BusMaster enable did not read back (wanted %04x, read %04x)\n",
+                  (unsigned int)commandWrite,
+                  (unsigned int)(commandVerify & 0xffffUL));
+            return NO;
+        }
+        IOLog("IDE: enabled PCI I/O and BusMaster (command %04x -> %04x)\n",
+              (unsigned int)(commandData & 0xffffUL),
+              (unsigned int)(commandVerify & 0xffffUL));
+    }
+
+    _bmiba = (unsigned short)bmiba;
 
     IOLog("IDE: version %s accepted BAR4 BMIBA %04x primary %04x secondary %04x max %u sectors\n",
           BMIDE_DRIVER_VERSION, _bmiba, _bmiba, _bmiba + 0x08,
