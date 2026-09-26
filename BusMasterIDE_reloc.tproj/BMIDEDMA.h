@@ -3,7 +3,7 @@
 
 /* Private polling code. Include after the DriverKit types and I/O primitives. */
 #define BMIDE_DMA_TIMESTAMP_POLL_MASK 0xff
-#define BMIDE_DMA_POLL_DELAY_US      10
+#define BMIDE_DMA_SLEEP_MS            1
 #define BMIDE_DMA_SHORT_DELAY_US      5
 #define BMIDE_DMA_FAST_POLLS         32
 #define BMIDE_BM_START              0x01
@@ -37,7 +37,13 @@ bmideDmaElapsedUsec(ns_time_t start, ns_time_t end)
 {
     ns_time_t elapsed;
 
-    elapsed = (end - start + 999ULL) / 1000ULL;
+    /* OPENSTEP's PIT timestamp can step backward at rollover. That is not
+     * an expired command. Do not let unsigned subtraction fabricate a
+     * multi-year wait. Round without addition overflow or __umoddi3, which
+     * the OPENSTEP kernel does not export. */
+    if (end <= start)
+        return 0;
+    elapsed = ((end - start) - 1ULL) / 1000ULL + 1ULL;
     return elapsed > 0xffffffffULL ? 0xffffffffU : (unsigned int)elapsed;
 }
 
@@ -97,9 +103,12 @@ bmidePollDma(unsigned short bmBase, BMIDERegs *regs,
     ns_time_t start;
     ns_time_t now;
     unsigned int polls;
+    unsigned int sleepBudgetUsec;
+    unsigned int sampledUsec;
     BMIDEDMAResult result;
 
     polls = 0;
+    sleepBudgetUsec = 0;
     completion->waited = 0;
     /* Command settling belongs before DMA START, not in this polling loop. */
     for (;;) {
@@ -116,29 +125,47 @@ bmidePollDma(unsigned short bmBase, BMIDERegs *regs,
             break;
         if (polls == 0)
             IOGetTimestamp(&start);
-        polls++;
-        if ((polls & BMIDE_DMA_TIMESTAMP_POLL_MASK) == 0) {
+        /* Saturate once the bounded fast path has finished. */
+        if (polls <= BMIDE_DMA_TIMESTAMP_POLL_MASK)
+            polls++;
+        if (polls > BMIDE_DMA_TIMESTAMP_POLL_MASK) {
             IOGetTimestamp(&now);
             completion->waited = bmideDmaElapsedUsec(start, now);
+            if (completion->waited < sleepBudgetUsec)
+                completion->waited = sleepBudgetUsec;
             if (completion->waited >= timeoutUsec) {
                 result = BMIDE_DMA_TIMEOUT;
                 break;
             }
+            /* Channel ownership and the DMA buffer remain held. Let other
+             * kernel threads run while the device is busy. Sample status
+             * and real elapsed time again after each wakeup. Also bound the
+             * number of sleeps if the PIT timestamp stops advancing; never
+             * restart the deadline when its counter steps backward. */
+            IOSleep(BMIDE_DMA_SLEEP_MS);
+            if (timeoutUsec - sleepBudgetUsec <= BMIDE_DMA_SLEEP_MS * 1000U)
+                sleepBudgetUsec = timeoutUsec;
+            else
+                sleepBudgetUsec += BMIDE_DMA_SLEEP_MS * 1000U;
+            continue;
         }
-        /* Bound immediate polling, then use finer spacing for short DMA.
-         * After the first timestamp checkpoint, slow transfers retain the
-         * existing 10 us spacing. All intervals remain busy waits.
-         */
+        /* Keep short completions cheap: immediate polls followed by at most
+         * 224 five-microsecond busy delays before the first sleep. */
         if (polls >= BMIDE_DMA_FAST_POLLS)
-            IODelay(polls <= BMIDE_DMA_TIMESTAMP_POLL_MASK
-                    ? BMIDE_DMA_SHORT_DELAY_US : BMIDE_DMA_POLL_DELAY_US);
+            IODelay(BMIDE_DMA_SHORT_DELAY_US);
     }
     /* Elapsed-time diagnostics are consumed only on failure. Avoid a clock
      * read and 64-bit conversion on every successful command.
      */
     if (result != BMIDE_DMA_COMPLETE && polls != 0) {
         IOGetTimestamp(&now);
-        completion->waited = bmideDmaElapsedUsec(start, now);
+        /* Preserve the elapsed value that caused timeout if a later clock
+         * sample steps backward before the caller logs the failure. */
+        sampledUsec = bmideDmaElapsedUsec(start, now);
+        if (completion->waited < sampledUsec)
+            completion->waited = sampledUsec;
+        if (completion->waited < sleepBudgetUsec)
+            completion->waited = sleepBudgetUsec;
     }
 
     /* The caller must preserve this result and snapshot before stopping DMA.

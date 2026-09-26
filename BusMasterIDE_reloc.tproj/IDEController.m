@@ -90,7 +90,7 @@
 #define WAIT_DMA_US             5000000
 #define DIAG_DMA_LOG_LIMIT      0
 #define DMA_MAX_ATTEMPTS        2
-#define BMIDE_DRIVER_VERSION   "0.21"
+#define BMIDE_DRIVER_VERSION   "0.22"
 
 static void
 bmideDelay400ns(BMIDERegs *regs)
